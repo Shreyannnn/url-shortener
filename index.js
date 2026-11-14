@@ -18,6 +18,37 @@ redis.connect().catch(() => console.error('Redis unavailable, running without ca
 
 const stats = { hits: 0, misses: 0 };
 const CACHE_ENABLED = process.env.CACHE_ENABLED !== 'false';
+const RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_ENABLED !== 'false';
+
+// Fixed-window rate limiter backed by Redis
+function rateLimiter({ name, limit, windowSec }) {
+  return async (req, res, next) => {
+    if (!RATE_LIMIT_ENABLED) return next();
+    const key = `rl:${name}:${req.ip}`;
+    try {
+      const [count] = await redis
+        .multi()
+        .incr(key)
+        .expire(key, windowSec, 'NX')
+        .exec();
+
+      res.set('X-RateLimit-Limit', String(limit));
+      res.set('X-RateLimit-Remaining', String(Math.max(0, limit - count)));
+
+      if (count > limit) {
+        const ttl = await redis.ttl(key);
+        res.set('Retry-After', String(ttl > 0 ? ttl : windowSec));
+        return res.status(429).json({ error: 'Too many requests, slow down' });
+      }
+    } catch {
+      // Redis is down: fail open (let the request through)
+    }
+    next();
+  };
+}
+
+const shortenLimiter = rateLimiter({ name: 'shorten', limit: 10, windowSec: 60 });
+const redirectLimiter = rateLimiter({ name: 'redirect', limit: 300, windowSec: 60 });
 
 function generateCode() {
   return crypto.randomBytes(5).toString('base64url').slice(0, 7);
@@ -46,7 +77,7 @@ app.get('/stats', (req, res) => {
 });
 
 // Create a short link
-app.post('/shorten', async (req, res) => {
+app.post('/shorten', shortenLimiter, async (req, res) => {
   const { url } = req.body || {};
   if (!url || !isValidUrl(url)) {
     return res.status(400).json({ error: 'Provide a valid http/https url' });
@@ -73,13 +104,12 @@ app.post('/shorten', async (req, res) => {
 });
 
 // Redirect a short link (cache-aside with Redis)
-app.get('/:code', async (req, res) => {
+app.get('/:code', redirectLimiter, async (req, res) => {
   const { code } = req.params;
   const key = `url:${code}`;
   try {
     let url = null;
     try {
-      // url = await redis.get(key);
       url = CACHE_ENABLED ? await redis.get(key) : null;
     } catch {
       // cache is down: fall through to the database
@@ -101,7 +131,6 @@ app.get('/:code', async (req, res) => {
 
     url = result.rows[0].original_url;
     try {
-      // await redis.set(key, url, { EX: 3600 });
       if (CACHE_ENABLED) await redis.set(key, url, { EX: 3600 });
     } catch {
       // ignore cache write failures
