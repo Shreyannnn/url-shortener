@@ -5,7 +5,10 @@ const { createClient } = require('redis');
 const pool = require('./db');
 
 const app = express();
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 app.use(express.json());
 
@@ -76,6 +79,9 @@ app.get('/stats', (req, res) => {
   });
 });
 
+// Browsers ask for this automatically; answer without touching the database
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // Create a short link
 app.post('/shorten', shortenLimiter, async (req, res) => {
   const { url } = req.body || {};
@@ -92,7 +98,7 @@ app.post('/shorten', shortenLimiter, async (req, res) => {
       );
       return res.status(201).json({
         short_code: code,
-        short_url: `http://localhost:${PORT}/${code}`,
+        short_url: `${BASE_URL}/${code}`,
       });
     } catch (err) {
       if (err.code === '23505') continue; // code already exists, try another
@@ -142,6 +148,18 @@ app.get('/:code', redirectLimiter, async (req, res) => {
   }
 });
 
+// Create the table on start-up if it doesn't exist (cloud databases start empty)
+pool
+  .query(
+    `CREATE TABLE IF NOT EXISTS urls (
+       id SERIAL PRIMARY KEY,
+       short_code VARCHAR(10) UNIQUE NOT NULL,
+       original_url TEXT NOT NULL,
+       created_at TIMESTAMP DEFAULT NOW()
+     )`
+  )
+  .catch((err) => console.error('Table setup failed:', err.message));
+
 app.listen(PORT, () => {
-  console.log(`Server on http://localhost:${PORT}`);
+  console.log(`Server on ${BASE_URL}`);
 });
